@@ -11,3 +11,15 @@ generator client {
 datasource db {
   provider = "postgresql"
 }
+
+model Portfolio {
+  id Int @id @default(uuid())
+  userId String // Supabase auth.users.id
+  name String
+  baseCurrency String @default("CAD")
+  createdAt dateTime @default(now())
+  updatedAt dateTime @updatedAt
+
+  accounts Account[]
+}
+
