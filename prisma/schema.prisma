@@ -12,14 +12,206 @@ datasource db {
   provider = "postgresql"
 }
 
-model Portfolio {
-  id Int @id @default(uuid())
-  userId String // Supabase auth.users.id
-  name String
-  baseCurrency String @default("CAD")
-  createdAt dateTime @default(now())
-  updatedAt dateTime @updatedAt
+enum AccountType {
+  brokerage
+  rrsp
+  tfsa
+  fhsa
+  resp
+  rrif
+  cash
+  crypto_exchange
+  bank
+  other
 
-  accounts Account[]
+  @@map("account_type")
 }
 
+enum AssetClass {
+  equity
+  etf
+  mutual_fund
+  bond
+  crypto
+  cash
+  other
+
+  @@map("asset_class")
+}
+
+enum TransactionType {
+  buy
+  sell
+  dividend
+  interest
+  fee
+  deposit
+  withdrawal
+  transfer_in
+  transfer_out
+  split
+
+  @@map("transaction_type")
+}
+
+enum TransactionSource {
+  manual
+  csv
+
+  @@map("transaction_source")
+}
+
+// ─────────────────────────────────────────────────────────────
+// User-owned data (RLS: auth.uid() = user_id)
+// ─────────────────────────────────────────────────────────────
+
+model Portfolio {
+  id           String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId       String   @map("user_id") @db.Uuid // Supabase auth.users.id
+  name         String
+  baseCurrency String   @default("CAD") @map("base_currency") @db.Char(3)
+  createdAt    DateTime @default(now()) @map("created_at")
+  updatedAt    DateTime @updatedAt @map("updated_at")
+
+  accounts Account[]
+
+  @@index([userId])
+  @@map("portfolios")
+}
+
+model Account {
+  id          String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  portfolioId String    @map("portfolio_id") @db.Uuid
+  portfolio   Portfolio @relation(fields: [portfolioId], references: [id], onDelete: Cascade)
+  userId      String    @map("user_id") @db.Uuid
+
+  name        String
+  institution String?
+  accountType AccountType @default(brokerage) @map("account_type")
+  currency    String      @default("CAD") @db.Char(3) // account's reporting currency; Transaction.fxRate converts into this
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  holdings      Holding[]
+  importBatches ImportBatch[]
+
+  @@index([portfolioId])
+  @@index([userId])
+  @@map("accounts")
+}
+
+// Cash is modelled as a holding: one per currency per account,
+// assetClass = cash, symbol = currency code (e.g. "CAD"), exchange = "CASH".
+model Holding {
+  id        String  @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  accountId String  @map("account_id") @db.Uuid
+  account   Account @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  userId    String  @map("user_id") @db.Uuid
+
+  symbol     String // "AAPL", "SHOP", "BTC", "CAD"
+  exchange   String // "NASDAQ", "TSX", "CRYPTO", "CASH" — required so the unique constraint works (NULLs never collide)
+  name       String? // "Apple Inc."
+  assetClass AssetClass @default(equity) @map("asset_class")
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  transactions Transaction[]
+
+  @@unique([accountId, symbol, exchange]) // also serves as the accountId index
+  @@index([userId])
+  @@map("holdings")
+}
+
+// Field semantics by type (CHECK constraints in the SQL migration enforce these):
+//   buy / sell      quantity = shares, pricePerUnit = price per share, amount = null
+//   transfer_in/out quantity = shares, pricePerUnit = ORIGINAL avg cost per share (carries cost basis over)
+//   split           quantity = share delta (2-for-1 on 100 sh → 100; reverse splits negative), pricePerUnit = null
+//   dividend        holding = paying security, amount = cash received, quantity/pricePerUnit = null
+//   interest / fee / deposit / withdrawal
+//                   holding = the account's cash holding, amount = cash moved, quantity/pricePerUnit = null
+// The cash balance is derived from ALL of an account's transactions (buys debit, sells/dividends credit),
+// not only from rows on the cash holding.
+// Ordering for average cost: transactionDate, then sequence (imports), then createdAt.
+model Transaction {
+  id        String  @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  holdingId String  @map("holding_id") @db.Uuid
+  holding   Holding @relation(fields: [holdingId], references: [id], onDelete: Cascade)
+  userId    String  @map("user_id") @db.Uuid
+
+  type         TransactionType
+  quantity     Decimal?        @db.Decimal(24, 8) // shares/units; null for cash-only rows
+  pricePerUnit Decimal?        @map("price_per_unit") @db.Decimal(20, 8)
+  amount       Decimal?        @db.Decimal(20, 8) // total cash moved; cash-only rows
+  fees         Decimal         @default(0) @db.Decimal(20, 8)
+  currency     String          @db.Char(3) // currency THIS transaction happened in
+  fxRate       Decimal?        @map("fx_rate") @db.Decimal(20, 10) // currency → account currency on transactionDate; null if same
+
+  transactionDate DateTime @map("transaction_date") @db.Date
+  sequence        Int? // tiebreaker for same-day rows (set from CSV row order)
+  notes           String?
+
+  source        TransactionSource @default(manual)
+  importBatchId String?           @map("import_batch_id") @db.Uuid
+  importBatch   ImportBatch?      @relation(fields: [importBatchId], references: [id], onDelete: Cascade)
+  dedupeHash    String?           @map("dedupe_hash") // null for manual rows
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@unique([holdingId, dedupeHash])
+  @@index([holdingId, transactionDate])
+  @@index([userId])
+  @@index([importBatchId])
+  @@map("transactions")
+}
+
+// Deleting a batch deletes its transactions → "undo this import".
+model ImportBatch {
+  id        String  @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  accountId String  @map("account_id") @db.Uuid
+  account   Account @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  userId    String  @map("user_id") @db.Uuid
+
+  broker   String // which adapter parsed it, e.g. "wealthsimple"
+  fileName String @map("file_name")
+  rowCount Int    @map("row_count")
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  transactions Transaction[]
+
+  @@index([accountId])
+  @@index([userId])
+  @@map("import_batches")
+}
+
+// ─────────────────────────────────────────────────────────────
+// Shared market data (no user_id; RLS: authenticated read, service role write)
+// ─────────────────────────────────────────────────────────────
+
+model Price {
+  symbol   String
+  exchange String
+  date     DateTime @db.Date
+  close    Decimal  @db.Decimal(20, 8)
+  currency String   @db.Char(3)
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@id([symbol, exchange, date])
+  @@map("prices")
+}
+
+model FxRate {
+  base  String   @db.Char(3)
+  quote String   @db.Char(3)
+  date  DateTime @db.Date
+  rate  Decimal  @db.Decimal(20, 10) // 1 base = rate quote
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@id([base, quote, date])
+  @@map("fx_rates")
+}
